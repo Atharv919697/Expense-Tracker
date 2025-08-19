@@ -8,21 +8,19 @@
 # increase resources.
 
 services:
+  services:
   - type: web
     name: wa-bot
     env: node
-    plan: free          # change to 'starter' later for 24x7
-    rootDir: whatsapp-bot
+    plan: free
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node index.js
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
         value: 18
-      # Optional: set this after you create an n8n webhook
-      # - key: N8N_WEBHOOK_URL
-      #   value: https://your-n8n-url/webhook/xxxx
+
 
   - type: web
     plan: free
