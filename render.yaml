@@ -9,6 +9,22 @@
 
 services:
   - type: web
+    name: wa-bot
+    env: node
+    plan: free          # change to 'starter' later for 24x7
+    rootDir: whatsapp-bot
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 18
+      # Optional: set this after you create an n8n webhook
+      # - key: N8N_WEBHOOK_URL
+      #   value: https://your-n8n-url/webhook/xxxx
+
+  - type: web
     plan: free
     # This is the runtime for services that pull a prebuilt Docker image
     runtime: image
