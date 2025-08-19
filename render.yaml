@@ -8,7 +8,6 @@
 # increase resources.
 
 services:
-  services:
   - type: web
     name: wa-bot
     env: node
