@@ -11,14 +11,17 @@ services:
   - type: web
     name: wa-bot
     env: node
-    plan: free
+    plan: free               # change to 'starter' for 24/7
     buildCommand: npm install
-    startCommand: node index.js
+    startCommand: npm start
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
       - key: NODE_VERSION
         value: 18
+      # Optional: uncomment after you create an n8n webhook
+      # - key: N8N_WEBHOOK_URL
+      #   value: https://your-n8n-domain/webhook/XXXX
 
 
   - type: web
