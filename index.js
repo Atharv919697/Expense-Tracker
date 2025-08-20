@@ -3,7 +3,10 @@ import * as nodeCrypto from "crypto";
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
 // --- Imports ---
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
+import * as baileys from "@whiskeysockets/baileys";
+
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
+
 import qrcode from "qrcode-terminal";
 import express from "express";
 import axios from "axios";
