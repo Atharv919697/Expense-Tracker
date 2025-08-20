@@ -8,12 +8,19 @@ const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
 import qrcode from "qrcode-terminal";
 import express from "express";
 import axios from "axios";
+import fs from "fs";
 
 // --- 3) Config ---
 const GROUP_JID = "120363419674431478@g.us";   // your WhatsApp group
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
-// --- 4) Natural parser ---
+// Choose a writable auth directory:
+// - If a Disk is attached on Render, /data exists -> persistent
+// - Otherwise (Free plan), use /tmp -> NOT persistent across deploys
+const AUTH_BASE = process.env.AUTH_DIR || (fs.existsSync("/data") ? "/data" : "/tmp");
+console.log("Auth directory:", `${AUTH_BASE}/auth_info`);
+
+// --- 4) Natural parser (no fixed format) ---
 const STOPWORDS = new Set([
   "i","we","for","on","of","and","the","to","a","an","my","our","your","with","at",
   "rs","rs.","inr","₹","rupees","paid","pay","spent","buy","bought","purchase","purchased",
@@ -36,7 +43,7 @@ function parseNaturalExpense(rawText) {
   const amountRe = /\b(?:rs|inr)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\b/gi;
   let m, last = null;
   while ((m = amountRe.exec(text)) !== null) {
-    last = { value: m[1], index: m.index };
+    last = { value: m[1] };
   }
   if (!last) return null;
 
@@ -45,22 +52,17 @@ function parseNaturalExpense(rawText) {
 
   const tokens = text.split(" ").map(cleanToken).filter(Boolean);
 
-  // find approximate token near the price
-  let amountIdx = -1;
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].includes(last.value.replace(/,/g, ""))) { amountIdx = i; break; }
-  }
-
-  const around = tokens.slice(Math.max(0, amountIdx - 4), Math.min(tokens.length, amountIdx + 5));
+  // take 4 tokens around the amount and filter stopwords/numbers
+  const idx = tokens.findIndex(t => t.includes(last.value.replace(/,/g, "")));
+  const around = tokens.slice(Math.max(0, idx - 4), Math.min(tokens.length, idx + 5));
   const itemTokens = around.filter(t => !STOPWORDS.has(t) && !/^\d/.test(t));
   let item = itemTokens.join(" ").trim();
-
   if (!item) item = "misc";
 
   return { item, price };
 }
 
-// --- 5) Resolve @mention to name ---
+// --- 5) Resolve @mention to a display name (optional) ---
 async function resolveMentionName(sock, jid) {
   try {
     const c = await sock?.onWhatsApp?.(jid);
@@ -72,7 +74,7 @@ async function resolveMentionName(sock, jid) {
 
 // --- 6) Bot bootstrap ---
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("/data/auth_info"); // persistent disk
+  const { state, saveCreds } = await useMultiFileAuthState(`${AUTH_BASE}/auth_info`);
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
@@ -90,8 +92,10 @@ async function startBot() {
     if (connection === "open") console.log("✅ WhatsApp connected!");
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
+      const reason = lastDisconnect?.error?.message || code;
+      console.log("Connection closed:", reason);
       if (code !== DisconnectReason.loggedOut) startBot();
-      else console.log("Logged out — delete /data/auth_info and redeploy to rescan QR.");
+      else console.log(`Logged out — delete ${AUTH_BASE}/auth_info and redeploy to rescan QR.`);
     }
   });
 
@@ -99,18 +103,22 @@ async function startBot() {
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg || !msg.message) return;
-    const jid = String(msg.key.remoteJid || "");
-    if (jid !== GROUP_JID) return;
 
-    const text = msg.message.conversation ||
+    const jid = String(msg.key.remoteJid || "");
+    if (jid !== GROUP_JID) return;                   // only your group
+
+    const text =
+      msg.message.conversation ||
       msg.message?.extendedTextMessage?.text ||
       msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+
     if (!text) return;
 
-    // Name logic
+    // pick name = sender; if @mention exists, use mentioned person
     let payerName = msg.pushName || "";
-    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid
-                   || msg.message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo?.mentionedJid;
+    const mentioned =
+      msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
+      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo?.mentionedJid;
     if (Array.isArray(mentioned) && mentioned.length > 0) {
       const mentionName = await resolveMentionName(sock, mentioned[0]);
       if (mentionName) payerName = mentionName;
@@ -119,9 +127,8 @@ async function startBot() {
     console.log("📩", payerName, ":", text);
 
     const parsed = parseNaturalExpense(text);
-    if (!parsed) return; // skip non-expense messages
+    if (!parsed) return;  // not an expense-like message
 
-    // Build payload for n8n
     const payload = {
       name: payerName,
       item: parsed.item,
@@ -131,15 +138,17 @@ async function startBot() {
       ts: Number(msg.messageTimestamp) * 1000
     };
 
-    // Send to n8n
+    // Send to n8n (if configured)
     let postedOK = false;
     if (N8N_WEBHOOK_URL) {
       try {
-        await axios.post(N8N_WEBHOOK_URL, payload);
+        await axios.post(N8N_WEBHOOK_URL, payload, { timeout: 8000 });
         postedOK = true;
       } catch (e) {
-        console.log("n8n webhook error:", e.message);
+        console.log("n8n webhook error:", e?.response?.status, e?.message);
       }
+    } else {
+      console.log("N8N_WEBHOOK_URL not set; skipping POST.");
     }
 
     // Confirm in group
