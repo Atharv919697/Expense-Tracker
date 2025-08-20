@@ -1,63 +1,49 @@
-// --- Fix for "crypto is not defined" on some Node/ESM hosts ---
+// --- 1) WebCrypto polyfill (fixes "crypto is not defined" on some hosts) ---
 import * as nodeCrypto from "crypto";
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
-// --- Imports ---
+// --- 2) Imports ---
 import * as baileys from "@whiskeysockets/baileys";
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
-
 import qrcode from "qrcode-terminal";
 import express from "express";
 import axios from "axios";
 
-// ====== CONFIG ======
-// Your WhatsApp Group ID (JID) — we will only read messages from this group
+// --- 3) Config ---
+// Your expense group (only this group is processed)
 const GROUP_JID = "120363419674431478@g.us";
-
-// Optional: n8n webhook to receive parsed expenses (set in Render → Environment)
+// Optional: set in Render -> wa-bot -> Environment
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
-// ====== HELPERS ======
-/**
- * Parse expense lines like:
- *   "Name | Item | Price"
- *   "Name, Item, Price"
- *   "Name - Item - Price"
- * Also supports short form:
- *   "Item | Price"
- *   "Item, Price"
- *
- * @param {string} text
- * @param {string} fallbackName  Sender name used if no explicit name is provided
- * @returns {{name:string,item:string,price:number}|null}
+// --- 4) Helpers ---
+/** Parse:
+ *  "Name | Item | Price"  (also supports commas/semicolons/dashes as separators)
+ *  or short form: "Item | Price"  (uses sender's pushName as Name)
  */
 function parseExpense(text, fallbackName) {
   // normalize separators to |
   const clean = text.replace(/[;,–-]+/g, "|").replace(/\s*\|\s*/g, "|").trim();
 
-  // Try: Name|Item|Price
-  const m = clean.match(/^([^|]+)\|([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
-  if (m) {
-    return { name: m[1].trim(), item: m[2].trim(), price: parseFloat(m[3]) };
-  }
+  // Name|Item|Price
+  let m = clean.match(/^([^|]+)\|([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
+  if (m) return { name: m[1].trim(), item: m[2].trim(), price: parseFloat(m[3]) };
 
-  // Try: Item|Price -> use sender name
-  const m2 = clean.match(/^([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
-  if (m2) {
-    return { name: (fallbackName || "").trim(), item: m2[1].trim(), price: parseFloat(m2[2]) };
-  }
+  // Item|Price  (take sender name)
+  m = clean.match(/^([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
+  if (m) return { name: (fallbackName || "").trim(), item: m[1].trim(), price: parseFloat(m[2]) };
 
-  return null; // not an expense line
+  return null;
 }
 
-// ====== BOT ======
+// --- 5) Bot bootstrap ---
 async function startBot() {
+  // Persist session on disk
   const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // we print QR manually below
-    browser: ["RenderBot", "Chrome", "1.0"]
+    printQRInTerminal: false,                 // we render our own QR below
+    browser: ["RenderBot", "Chrome", "1.0"], // just an identifier
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -66,8 +52,8 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("Scan this QR with WhatsApp → Linked devices:");
-      qrcode.generate(qr, { small: true });
+      console.log("Scan this QR with WhatsApp → Linked Devices:");
+      qrcode.generate(qr, { small: true });   // ASCII QR in Render logs
     }
 
     if (connection === "open") {
@@ -80,28 +66,24 @@ async function startBot() {
       console.log("❌ Connection closed:", reason);
 
       if (code !== DisconnectReason.loggedOut) {
-        // reconnect
-        startBot();
+        startBot(); // auto-reconnect
       } else {
         console.log("Logged out — delete ./auth_info and redeploy to re-scan QR.");
       }
     }
   });
 
-  // Handle incoming messages
+  // --- message handler ---
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg || !msg.message) return;
 
     // ignore status broadcasts
-    if (msg.key.remoteJid === "status@broadcast") return;
-
-    // only group messages
     const jid = String(msg.key.remoteJid || "");
-    if (!jid.endsWith("@g.us")) return;
+    if (jid === "status@broadcast") return;
 
-    // only your chosen group
-    if (jid !== GROUP_JID) return;
+    // only group messages, only YOUR group
+    if (!jid.endsWith("@g.us") || jid !== GROUP_JID) return;
 
     // extract text
     const text =
@@ -114,30 +96,26 @@ async function startBot() {
     const senderName = msg.pushName || "";
     console.log("📩 From group:", jid, "| Sender:", senderName, "| Text:", text);
 
-    // simple health test
+    // quick health check
     if (text.trim().toLowerCase() === "ping") {
       await sock.sendMessage(jid, { text: "pong ✅" });
       return;
     }
 
-    // try to parse an expense
+    // parse expense line
     const parsed = parseExpense(text, senderName);
-    if (!parsed) {
-      // Not an expense — silently skip (or guide the format if you prefer)
-      // await sock.sendMessage(jid, { text: "Use: Name | Item | Price  (or: Item | Price)" });
-      return;
-    }
+    if (!parsed) return; // silently ignore non-expense messages
 
-    // Send to n8n if configured
+    // 6) Send to n8n webhook (if configured)
     let postedOK = false;
     if (N8N_WEBHOOK_URL) {
       try {
         await axios.post(N8N_WEBHOOK_URL, {
-          ...parsed,                    // { name, item, price }
+          ...parsed,                           // { name, item, price }
           jid,
           pushName: senderName,
           raw: text,
-          ts: Number(msg.messageTimestamp) * 1000 // milliseconds
+          ts: Number(msg.messageTimestamp) * 1000 // ms
         });
         postedOK = true;
       } catch (e) {
@@ -145,7 +123,7 @@ async function startBot() {
       }
     }
 
-    // confirm inside the group
+    // 7) Confirmation message in the group
     const rupee = "₹";
     const status = postedOK ? "added" : "received";
     await sock.sendMessage(
@@ -155,7 +133,7 @@ async function startBot() {
   });
 }
 
-// ====== HTTP health server (Render needs this) ======
+// --- 8) Minimal HTTP server for Render health checks ---
 const app = express();
 app.get("/", (_req, res) => res.send("Baileys bot is running."));
 app.get("/healthz", (_req, res) => res.send("ok"));
