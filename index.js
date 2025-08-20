@@ -15,6 +15,9 @@ const GROUP_JID = "120363419674431478@g.us";
 // Optional: set in Render -> wa-bot -> Environment
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
+// --- Debug log for webhook ---
+console.log("N8N_WEBHOOK_URL:", N8N_WEBHOOK_URL ? "(set)" : "(NOT set)");
+
 // --- 4) Helpers ---
 /** Parse:
  *  "Name | Item | Price"  (also supports commas/semicolons/dashes as separators)
@@ -108,18 +111,27 @@ async function startBot() {
 
     // 6) Send to n8n webhook (if configured)
     let postedOK = false;
-    if (N8N_WEBHOOK_URL) {
+    if (!N8N_WEBHOOK_URL) {
+      console.log("Skipping n8n POST: N8N_WEBHOOK_URL is not set.");
+    } else {
       try {
-        await axios.post(N8N_WEBHOOK_URL, {
-          ...parsed,                           // { name, item, price }
-          jid,
-          pushName: senderName,
-          raw: text,
-          ts: Number(msg.messageTimestamp) * 1000 // ms
-        });
+        console.log("Posting to n8n:", N8N_WEBHOOK_URL);
+        await axios.post(
+          N8N_WEBHOOK_URL,
+          {
+            ...parsed,                           // { name, item, price }
+            jid,
+            pushName: senderName,
+            raw: text,
+            ts: Number(msg.messageTimestamp) * 1000 // ms
+          },
+          { timeout: 6000 }
+        );
         postedOK = true;
+        console.log("n8n POST ok");
       } catch (e) {
-        console.log("n8n webhook error:", e?.message);
+        console.log("n8n webhook error:", e?.response?.status, e?.response?.statusText, e?.message);
+        if (e?.response?.data) console.log("n8n error body:", JSON.stringify(e.response.data));
       }
     }
 
