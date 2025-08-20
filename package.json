@@ -1,16 +1,13 @@
 {
-  "name": "whatsapp-bot",
+  "name": "wa-bot",
   "version": "1.0.0",
-  "description": "WhatsApp bot using Baileys and Render",
   "main": "index.js",
-  "type": "commonjs",
+  "license": "MIT",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@adiwajshing/baileys": "^6.7.5"
-  },
-  "engines": {
-    "node": "18.x"
+    "@whiskeysockets/baileys": "^6.7.1",
+    "qrcode-terminal": "^0.12.0"
   }
 }
