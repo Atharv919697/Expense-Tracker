@@ -4,7 +4,6 @@ if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
 // --- Imports ---
 import * as baileys from "@whiskeysockets/baileys";
-
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
 
 import qrcode from "qrcode-terminal";
