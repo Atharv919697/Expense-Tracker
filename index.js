@@ -10,31 +10,64 @@ import qrcode from "qrcode-terminal";
 import express from "express";
 import axios from "axios";
 
-// Optional: if you already have an n8n webhook, set this in Render env vars
-// Render → your service → Environment → Add Variable → N8N_WEBHOOK_URL=https://your-n8n/webhook/...
+// ====== CONFIG ======
+// Your WhatsApp Group ID (JID) — we will only read messages from this group
+const GROUP_JID = "120363419674431478@g.us";
+
+// Optional: n8n webhook to receive parsed expenses (set in Render → Environment)
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
-// ---- WhatsApp Bot ----
+// ====== HELPERS ======
+/**
+ * Parse expense lines like:
+ *   "Name | Item | Price"
+ *   "Name, Item, Price"
+ *   "Name - Item - Price"
+ * Also supports short form:
+ *   "Item | Price"
+ *   "Item, Price"
+ *
+ * @param {string} text
+ * @param {string} fallbackName  Sender name used if no explicit name is provided
+ * @returns {{name:string,item:string,price:number}|null}
+ */
+function parseExpense(text, fallbackName) {
+  // normalize separators to |
+  const clean = text.replace(/[;,–-]+/g, "|").replace(/\s*\|\s*/g, "|").trim();
+
+  // Try: Name|Item|Price
+  const m = clean.match(/^([^|]+)\|([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
+  if (m) {
+    return { name: m[1].trim(), item: m[2].trim(), price: parseFloat(m[3]) };
+  }
+
+  // Try: Item|Price -> use sender name
+  const m2 = clean.match(/^([^|]+)\|(\d+(?:\.\d{1,2})?)$/i);
+  if (m2) {
+    return { name: (fallbackName || "").trim(), item: m2[1].trim(), price: parseFloat(m2[2]) };
+  }
+
+  return null; // not an expense line
+}
+
+// ====== BOT ======
 async function startBot() {
-  // Persist session files in ./auth_info (Render will keep them between restarts on the same instance)
   const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // we draw QR with qrcode-terminal (ASCII) in logs
+    printQRInTerminal: false, // we print QR manually below
     browser: ["RenderBot", "Chrome", "1.0"]
   });
 
-  // Save updated creds to disk when they change
   sock.ev.on("creds.update", saveCreds);
 
-  // Connection + QR handling
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("Scan this QR with WhatsApp → Linked Devices:");
-      qrcode.generate(qr, { small: true }); // shows ASCII QR in Render logs
+      console.log("Scan this QR with WhatsApp → Linked devices:");
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
@@ -46,8 +79,8 @@ async function startBot() {
       const reason = lastDisconnect?.error?.message || code;
       console.log("❌ Connection closed:", reason);
 
-      // Reconnect unless the session was explicitly logged out from phone
       if (code !== DisconnectReason.loggedOut) {
+        // reconnect
         startBot();
       } else {
         console.log("Logged out — delete ./auth_info and redeploy to re-scan QR.");
@@ -55,7 +88,7 @@ async function startBot() {
     }
   });
 
-  // Message listener
+  // Handle incoming messages
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg || !msg.message) return;
@@ -63,6 +96,14 @@ async function startBot() {
     // ignore status broadcasts
     if (msg.key.remoteJid === "status@broadcast") return;
 
+    // only group messages
+    const jid = String(msg.key.remoteJid || "");
+    if (!jid.endsWith("@g.us")) return;
+
+    // only your chosen group
+    if (jid !== GROUP_JID) return;
+
+    // extract text
     const text =
       msg.message.conversation ||
       msg.message?.extendedTextMessage?.text ||
@@ -70,39 +111,57 @@ async function startBot() {
 
     if (!text) return;
 
-    console.log("📩 From:", msg.key.remoteJid, "Name:", msg.pushName, "Text:", text);
+    const senderName = msg.pushName || "";
+    console.log("📩 From group:", jid, "| Sender:", senderName, "| Text:", text);
 
-    // Simple test command
+    // simple health test
     if (text.trim().toLowerCase() === "ping") {
-      await sock.sendMessage(msg.key.remoteJid, { text: "pong ✅" });
+      await sock.sendMessage(jid, { text: "pong ✅" });
+      return;
     }
 
-    // OPTIONAL: forward to n8n webhook (for Google Sheets, etc.)
+    // try to parse an expense
+    const parsed = parseExpense(text, senderName);
+    if (!parsed) {
+      // Not an expense — silently skip (or guide the format if you prefer)
+      // await sock.sendMessage(jid, { text: "Use: Name | Item | Price  (or: Item | Price)" });
+      return;
+    }
+
+    // Send to n8n if configured
+    let postedOK = false;
     if (N8N_WEBHOOK_URL) {
       try {
         await axios.post(N8N_WEBHOOK_URL, {
-          jid: msg.key.remoteJid,
-          fromMe: msg.key.fromMe,
-          pushName: msg.pushName,
-          text,
-          timestamp: msg.messageTimestamp
+          ...parsed,                    // { name, item, price }
+          jid,
+          pushName: senderName,
+          raw: text,
+          ts: Number(msg.messageTimestamp) * 1000 // milliseconds
         });
+        postedOK = true;
       } catch (e) {
         console.log("n8n webhook error:", e?.message);
       }
     }
+
+    // confirm inside the group
+    const rupee = "₹";
+    const status = postedOK ? "added" : "received";
+    await sock.sendMessage(
+      jid,
+      { text: `✅ ${status}: ${parsed.name} | ${parsed.item} | ${rupee}${parsed.price}` }
+    );
   });
 }
 
-// ---- Minimal HTTP server so Render health checks pass ----
+// ====== HTTP health server (Render needs this) ======
 const app = express();
 app.get("/", (_req, res) => res.send("Baileys bot is running."));
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-// Render provides PORT; default to 3000 locally
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("HTTP health server listening on", PORT);
-  // start the WhatsApp socket after HTTP server is ready
   startBot();
 });
