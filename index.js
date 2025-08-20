@@ -1,4 +1,4 @@
-// --- 1) WebCrypto polyfill (fixes "crypto is not defined" on some hosts) ---
+// --- 1) WebCrypto polyfill (Render/Node compat) ---
 import * as nodeCrypto from "crypto";
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
@@ -11,16 +11,15 @@ import axios from "axios";
 import fs from "fs";
 
 // --- 3) Config ---
-const GROUP_JID = "120363419674431478@g.us";   // your WhatsApp group
+const GROUP_JID = "120363419674431478@g.us";   // your WhatsApp group ID
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
-// Choose a writable auth directory:
-// - If a Disk is attached on Render, /data exists -> persistent
-// - Otherwise (Free plan), use /tmp -> NOT persistent across deploys
-const AUTH_BASE = process.env.AUTH_DIR || (fs.existsSync("/data") ? "/data" : "/tmp");
+// Writable cred location: /data if disk exists, else /tmp (non-persistent)
+const AUTH_BASE =
+  process.env.AUTH_DIR || (fs.existsSync("/data") ? "/data" : "/tmp");
 console.log("Auth directory:", `${AUTH_BASE}/auth_info`);
 
-// --- 4) Natural parser (no fixed format) ---
+// --- 4) Natural-language expense parser (no fixed format) ---
 const STOPWORDS = new Set([
   "i","we","for","on","of","and","the","to","a","an","my","our","your","with","at",
   "rs","rs.","inr","₹","rupees","paid","pay","spent","buy","bought","purchase","purchased",
@@ -33,26 +32,23 @@ function cleanToken(t) {
 
 function parseNaturalExpense(rawText) {
   if (!rawText) return null;
+
   const text = rawText.toLowerCase()
     .replace(/[₹]/g, " rs ")
     .replace(/rs\./g, " rs ")
     .replace(/\s+/g, " ")
     .trim();
 
-  // find the LAST number in the message
+  // take the LAST amount in the message
   const amountRe = /\b(?:rs|inr)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\b/gi;
   let m, last = null;
-  while ((m = amountRe.exec(text)) !== null) {
-    last = { value: m[1] };
-  }
+  while ((m = amountRe.exec(text)) !== null) last = { value: m[1] };
   if (!last) return null;
 
   const price = parseFloat(last.value.replace(/,/g, ""));
   if (!isFinite(price) || price <= 0) return null;
 
   const tokens = text.split(" ").map(cleanToken).filter(Boolean);
-
-  // take 4 tokens around the amount and filter stopwords/numbers
   const idx = tokens.findIndex(t => t.includes(last.value.replace(/,/g, "")));
   const around = tokens.slice(Math.max(0, idx - 4), Math.min(tokens.length, idx + 5));
   const itemTokens = around.filter(t => !STOPWORDS.has(t) && !/^\d/.test(t));
@@ -62,7 +58,7 @@ function parseNaturalExpense(rawText) {
   return { item, price };
 }
 
-// --- 5) Resolve @mention to a display name (optional) ---
+// --- 5) Resolve @mention to a display name (optional helper) ---
 async function resolveMentionName(sock, jid) {
   try {
     const c = await sock?.onWhatsApp?.(jid);
@@ -86,7 +82,7 @@ async function startBot() {
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
-      console.log("Scan QR code in WhatsApp → Linked Devices:");
+      console.log("Scan QR in WhatsApp → Linked Devices:");
       qrcode.generate(qr, { small: true });
     }
     if (connection === "open") console.log("✅ WhatsApp connected!");
@@ -99,22 +95,34 @@ async function startBot() {
     }
   });
 
-  // --- 7) Message handler ---
+  // --- 7) Message handler (with anti-loop guards) ---
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg || !msg.message) return;
 
     const jid = String(msg.key.remoteJid || "");
-    if (jid !== GROUP_JID) return;                   // only your group
+    if (jid === "status@broadcast") return;     // ignore status
+    if (jid !== GROUP_JID) return;              // only your group
 
+    // 🔒 prevent reply loops: ignore our own messages
+    const myIdBare = (sock?.user?.id || "").split(":")[0];
+    const participant = msg.key.participant || msg.participant || "";
+    const isFromMe = msg.key.fromMe || (participant && participant.includes(myIdBare));
+    if (isFromMe) return;
+
+    // extract plain text
     const text =
       msg.message.conversation ||
       msg.message?.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+      "";
 
     if (!text) return;
 
-    // pick name = sender; if @mention exists, use mentioned person
+    // also ignore our confirmation lines if someone copies/forwards them
+    if (/^\s*✅\s*added:/i.test(text)) return;
+
+    // decide payer name (sender by default, or @mention if present)
     let payerName = msg.pushName || "";
     const mentioned =
       msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ||
@@ -127,7 +135,7 @@ async function startBot() {
     console.log("📩", payerName, ":", text);
 
     const parsed = parseNaturalExpense(text);
-    if (!parsed) return;  // not an expense-like message
+    if (!parsed) return; // not an expense-like message
 
     const payload = {
       name: payerName,
@@ -138,12 +146,14 @@ async function startBot() {
       ts: Number(msg.messageTimestamp) * 1000
     };
 
-    // Send to n8n (if configured)
+    // POST to n8n
     let postedOK = false;
     if (N8N_WEBHOOK_URL) {
       try {
+        console.log("Posting to n8n:", N8N_WEBHOOK_URL);
         await axios.post(N8N_WEBHOOK_URL, payload, { timeout: 8000 });
         postedOK = true;
+        console.log("n8n POST ok");
       } catch (e) {
         console.log("n8n webhook error:", e?.response?.status, e?.message);
       }
@@ -151,14 +161,14 @@ async function startBot() {
       console.log("N8N_WEBHOOK_URL not set; skipping POST.");
     }
 
-    // Confirm in group
+    // confirmation message
     await sock.sendMessage(jid, {
-      text: `✅ ${postedOK ? "added" : "noted"}: ${payload.name} · ${payload.item} · ₹${payload.price}`
+      text: `✅ added:  · ${payload.name.toLowerCase()} ${payload.item.toLowerCase()} · ₹${payload.price}`
     });
   });
 }
 
-// --- 8) Minimal Express server (for Render health checks) ---
+// --- 8) Minimal health server (Render pings) ---
 const app = express();
 app.get("/", (_req, res) => res.send("Baileys bot running."));
 app.get("/healthz", (_req, res) => res.send("ok"));
