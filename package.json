@@ -1,16 +1,16 @@
 {
-  "name": "wa-bot",
+  "name": "wa-expense-bot",
   "version": "1.0.0",
-  "private": true,
+  "description": "WhatsApp Expense Tracker Bot using Baileys + n8n",
+  "main": "index.js",
   "type": "module",
-  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.6.0",
-    "axios": "1.7.2",
-    "express": "4.19.2",
-    "qrcode-terminal": "0.12.0"
+    "@whiskeysockets/baileys": "^6.7.8",
+    "axios": "^1.6.8",
+    "express": "^4.18.2",
+    "qrcode-terminal": "^0.12.0"
   }
 }
