@@ -11,12 +11,15 @@ import axios from "axios";
 import fs from "fs";
 
 // --- 3) Config ---
-const GROUP_JID = "120363419674431478@g.us";           // << your group ID
+const GROUP_JID = "120363419674431478@g.us"; // your group
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 
-// Writable creds: use /data if a Disk is attached (Starter), else /tmp (Free)
+// Writable creds: /data if Disk exists (Starter), else /tmp (Free)
 const AUTH_BASE = process.env.AUTH_DIR || (fs.existsSync("/data") ? "/data" : "/tmp");
-console.log("Auth directory:", `${AUTH_BASE}/auth_info`);
+const AUTH_DIR = `${AUTH_BASE}/auth_info`;
+console.log("[BOOT] Group:", GROUP_JID);
+console.log("[BOOT] Auth directory:", AUTH_DIR);
+console.log("[BOOT] N8N_WEBHOOK_URL:", N8N_WEBHOOK_URL ? "(set)" : "(NOT set)");
 
 // --- 4) Natural-language expense parser (no fixed format) ---
 const STOPWORDS = new Set([
@@ -29,29 +32,50 @@ function cleanToken(t) {
   return t.replace(/[^\p{L}\p{N}]/gu, "").trim();
 }
 
+// Returns { item, price } or null
 function parseNaturalExpense(rawText) {
   if (!rawText) return null;
 
-  const text = rawText.toLowerCase()
+  const text = rawText
+    .toLowerCase()
     .replace(/[₹]/g, " rs ")
     .replace(/rs\./g, " rs ")
     .replace(/\s+/g, " ")
     .trim();
 
-  // choose the LAST numeric amount in the text
+  // Find all monetary-looking numbers; prefer the LAST one (typical natural phrasing)
   const amountRe = /\b(?:rs|inr)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\b/gi;
-  let m, last = null;
-  while ((m = amountRe.exec(text)) !== null) last = { value: m[1] };
-  if (!last) return null;
+  let m, matches = [];
+  while ((m = amountRe.exec(text)) !== null) {
+    matches.push({ value: m[1], index: m.index });
+  }
+  if (matches.length === 0) return null;
 
-  const price = parseFloat(last.value.replace(/,/g, ""));
-  if (!isFinite(price) || price <= 0) return null;
+  // Choose the last match
+  const last = matches[matches.length - 1];
+  const numeric = last.value.replace(/,/g, "");
+  const price = parseFloat(numeric);
+  if (!Number.isFinite(price) || price <= 0) return null;
 
+  // Tokenize and try to get words around the amount
   const tokens = text.split(" ").map(cleanToken).filter(Boolean);
-  const amountIdx = tokens.findIndex(t => t.includes(last.value.replace(/,/g, "")));
+  // Try to find the token that includes the raw numeric (without commas)
+  const amountIdx = tokens.findIndex(t => t.includes(numeric));
   const around = tokens.slice(Math.max(0, amountIdx - 4), Math.min(tokens.length, amountIdx + 5));
-  const itemTokens = around.filter(t => !STOPWORDS.has(t) && !/^\d/.test(t));
+  let itemTokens = around.filter(t => !STOPWORDS.has(t) && !/^\d/.test(t));
+
+  // Fallbacks if we ended up with nothing meaningful
   let item = itemTokens.join(" ").trim();
+  if (!item) {
+    const preps = /(for|on|of)\s+([^0-9]+)$/i;
+    const mm = rawText.match(preps);
+    if (mm) item = mm[2].replace(/[^\p{L}\p{N}\s]/gu, "").trim().toLowerCase();
+  }
+  if (!item) {
+    // take first 3 non-stopword tokens from the whole text
+    const first = tokens.filter(t => !STOPWORDS.has(t) && !/^\d/.test(t)).slice(0, 3);
+    item = first.join(" ").trim();
+  }
   if (!item) item = "misc";
 
   return { item, price };
@@ -70,22 +94,33 @@ async function resolveMentionName(sock, jid) {
 // --- 6) Robust text extractor (many message types) ---
 function extractTextFromMessage(msg) {
   const m = msg.message || {};
+  const em = m.ephemeralMessage?.message || {};
+  const qm = m.extendedTextMessage?.contextInfo?.quotedMessage || {};
+  const qem = m.ephemeralMessage?.message?.extendedTextMessage?.contextInfo?.quotedMessage || {};
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
-    m.ephemeralMessage?.message?.extendedTextMessage?.text ||
+    em.extendedTextMessage?.text ||
     m.imageMessage?.caption ||
     m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    em.imageMessage?.caption ||
+    em.videoMessage?.caption ||
+    em.documentMessage?.caption ||
     m.buttonsResponseMessage?.selectedButtonId ||
     m.listResponseMessage?.singleSelectReply?.selectedRowId ||
     m.listResponseMessage?.title ||
+    // quoted text fallbacks
+    qm?.conversation ||
+    qem?.conversation ||
     ""
   );
 }
 
 // --- 7) Bot bootstrap ---
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(`${AUTH_BASE}/auth_info`);
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
@@ -106,11 +141,11 @@ async function startBot() {
       const reason = lastDisconnect?.error?.message || code;
       console.log("Connection closed:", reason);
       if (code !== DisconnectReason.loggedOut) startBot();
-      else console.log(`Logged out — delete ${AUTH_BASE}/auth_info and redeploy to rescan QR.`);
+      else console.log(`Logged out — delete ${AUTH_DIR} and redeploy to rescan QR.`);
     }
   });
 
-  // --- 8) Message handler with anti-loop + diagnostics ---
+  // --- 8) Message handler with anti-loop ---
   sock.ev.on("messages.upsert", async (up) => {
     try {
       const msg = up.messages?.[0];
@@ -119,15 +154,15 @@ async function startBot() {
       const jid = String(msg.key.remoteJid || "");
       const fromMe = !!msg.key.fromMe;
 
-      // basic filters
+      // Filters
       if (jid === "status@broadcast") return;  // ignore status
-      if (fromMe) return;                       // anti-loop: ignore our own messages
+      if (fromMe) return;                       // ignore our own messages (anti-loop)
       if (jid !== GROUP_JID) return;            // only your group
 
       const text = extractTextFromMessage(msg);
       if (!text || !text.trim()) return;
 
-      // ignore forwarded/copy of our confirmation
+      // ignore our confirmation if forwarded
       if (/^\s*✅\s*added:/i.test(text)) return;
 
       // payer name = sender; if @mention exists, use mentioned person
@@ -167,7 +202,7 @@ async function startBot() {
 
       // confirmation in group
       await sock.sendMessage(jid, {
-        text: `✅ added:  · ${payload.name.toLowerCase()} ${payload.item.toLowerCase()} · ₹${payload.price}`
+        text: `✅ added:  · ${payload.name} ${payload.item} · ₹${payload.price}`
       });
     } catch (err) {
       console.log("handler error:", err?.message || err);
