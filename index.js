@@ -6,7 +6,7 @@ if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 import * as baileys from "@whiskeysockets/baileys";
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
 import qrcode from "qrcode-terminal";
-import express from "express";
+import express from "express";       // <-- import ONCE, here
 import axios from "axios";
 
 const GROUP_JID = (process.env.GROUP_JID || "").trim();       // e.g. 120363419674431478@g.us
@@ -131,7 +131,16 @@ async function start() {
 }
 
 // tiny web server for Render
-import express from "express";
+const app = express();
+app.get("/", (_req, res) => res.send("wa-expense-bot up"));
+app.get("/healthz", (_req, res) => res.send("ok"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => { console.log("HTTP on", PORT); start(); });
+
+  });
+}
+
+// tiny web server for Render
 const app = express();
 app.get("/", (_req, res) => res.send("wa-expense-bot up"));
 app.get("/healthz", (_req, res) => res.send("ok"));
