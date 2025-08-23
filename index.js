@@ -6,13 +6,13 @@ if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 import * as baileys from "@whiskeysockets/baileys";
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
 import qrcode from "qrcode-terminal";
-import express from "express";       // <-- import ONCE, here
+import express from "express";
 import axios from "axios";
 
-const GROUP_JID = (process.env.GROUP_JID || "").trim();       // e.g. 120363419674431478@g.us
+const GROUP_JID = (process.env.GROUP_JID || "").trim();            // e.g. 120363419674431478@g.us
 const N8N_WEBHOOK_URL = (process.env.N8N_WEBHOOK_URL || "").trim();
 
-console.log("[BOOT] GROUP_JID:", GROUP_JID || "(NOT set!)");
+console.log("[BOOT] GROUP_JID:", GROUP_JID || "(NOT set! — set it in Render → Environment)");
 console.log("[BOOT] N8N_WEBHOOK_URL:", N8N_WEBHOOK_URL ? "(set)" : "(not set — skipping POSTs)");
 
 // ---- free-form parser: take the LAST amount and use the remainder as item
@@ -69,7 +69,7 @@ async function start() {
 
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log("Scan QR → Linked Devices:");
+      console.log("Scan QR → WhatsApp › Linked Devices:");
       qrcode.generate(qr, { small: true });
     }
     if (connection === "open") console.log("✅ WhatsApp connected!");
@@ -130,19 +130,13 @@ async function start() {
   });
 }
 
-// tiny web server for Render
+// ---- tiny web server for Render health checks
 const app = express();
 app.get("/", (_req, res) => res.send("wa-expense-bot up"));
 app.get("/healthz", (_req, res) => res.send("ok"));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log("HTTP on", PORT); start(); });
 
-  });
-}
-
-// tiny web server for Render
-const app = express();
-app.get("/", (_req, res) => res.send("wa-expense-bot up"));
-app.get("/healthz", (_req, res) => res.send("ok"));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log("HTTP on", PORT); start(); });
+app.listen(PORT, () => {
+  console.log("HTTP on", PORT);
+  start();
+});
